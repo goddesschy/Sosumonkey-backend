@@ -1,19 +1,16 @@
 """
-소수몽키 백엔드 — Day 3 (v2, 재무제표 기반)
-배경: Render IP에서 yfinance .info(quoteSummary)가 YFRateLimitError로 차단됨.
-      그러나 income_stmt / balance_sheet / quarterly_* / history / dividends / fast_info /
-      history_metadata 는 정상 작동(chart·fundamentals-timeseries 엔드포인트).
-설계: .info를 아예 호출하지 않고, 재무제표 + 메타데이터로 체크리스트 지표를 직접 계산.
-      (로컬에서 .info 원값과 대조 검증 완료: D/E·EPS·PER·매출성장·영업이익률 일치)
+소수몽키 백엔드 — Day 3 (v3, Render 실측 반영 최종)
+Render IP 실측 결론:
+  ✅ 작동: income_stmt / balance_sheet / quarterly_* / history / dividends / fast_info
+  ⚠️ history_metadata: 단독 접근 시 간헐 차단 → .history()를 먼저 부르면 그 응답에서 안정적으로 채워짐
+  ❌ 차단: .info / get_info / funds_data (quoteSummary 계열, YFRateLimitError)
+설계:
+  - 종목명/타입 = .history() 선호출 후 history_metadata 에서
+  - 가격/시총/52주/MA = fast_info (+history 폴백)
+  - 개별주 펀더멘털 = 재무제표 직접 계산 (.info 원값과 대조 검증 완료)
+  - ETF 운용보수/카테고리 = funds_data 시도 → 막히면 ETF_OVERRIDES(정적 맵)에서 보충
 
-엔드포인트:
-  GET /                  -> {"status":"ok"}
-  GET /quote?ticker=AAPL -> 공통 + (개별주 펀더멘털 | ETF 정보)
-  GET /diag?ticker=AAPL  -> 어떤 yfinance 경로가 사는지 진단
-
-단위(소수몽키 체크리스트용):
-  operatingMargin / roe / revenueGrowth = 소수(0.12 = 12%)
-  dividendYield / debtToEquity / expenseRatio = 퍼센트값(2.28 = 2.28%)
+단위: operatingMargin/roe/revenueGrowth = 소수 / dividendYield/debtToEquity/expenseRatio = 퍼센트값
 """
 
 import re
@@ -25,6 +22,14 @@ import yfinance as yf
 
 app = Flask(__name__)
 CORS(app)
+
+# funds_data가 Render에서 차단되므로, 보유 ETF의 정적 정보를 직접 보관(운용보수는 거의 안 변함).
+# 새 ETF 보유 시 여기에 한 줄 추가. AUM은 변동성이 커서 생략(필요 시 별도 소스).
+ETF_OVERRIDES = {
+    "SOXL": {"expenseRatio": 0.75, "category": "Trading--Leveraged Equity", "isLeveraged": True},
+    "SOXX": {"expenseRatio": 0.35, "category": "Technology", "isLeveraged": False},
+    "SMH":  {"expenseRatio": 0.35, "category": "Technology", "isLeveraged": False},
+}
 
 
 def num(v):
@@ -38,7 +43,6 @@ def num(v):
 
 
 def L(df, *labels, col=0):
-    """재무제표 df에서 label(여러 후보) 행의 col번째(최신=0) 값."""
     if df is None or getattr(df, "empty", True):
         return None
     for label in labels:
@@ -51,7 +55,6 @@ def L(df, *labels, col=0):
 
 
 def ttm(qdf, *labels, n=4):
-    """분기 df에서 label 행의 최근 n개 합(TTM). 값 있는 것만 합산."""
     if qdf is None or getattr(qdf, "empty", True):
         return None
     for label in labels:
@@ -71,11 +74,10 @@ def safe_attr(obj, name):
         return None
 
 
-def compute_beta(symbol, period="1y"):
-    """1년 일간 수익률, SPY 대비 베타(근사)."""
+def beta_from(stock_close, spy_close):
     try:
-        s = yf.Ticker(symbol).history(period=period)["Close"].pct_change().dropna()
-        m = yf.Ticker("SPY").history(period=period)["Close"].pct_change().dropna()
+        s = stock_close.pct_change().dropna()
+        m = spy_close.pct_change().dropna()
         j = s.to_frame("s").join(m.to_frame("m"), how="inner").dropna()
         if len(j) < 30:
             return None
@@ -88,11 +90,12 @@ def compute_beta(symbol, period="1y"):
 def dividend_yield_ttm(t, price):
     try:
         dv = t.dividends
-        if dv is None or len(dv) == 0 or not price:
-            return 0.0 if (dv is not None) else None
+        if dv is None or len(dv) == 0:
+            return 0.0
+        if not price:
+            return None
         cutoff = dv.index.max() - pd.Timedelta(days=365)
-        ttm_div = float(dv[dv.index >= cutoff].sum())
-        return round(ttm_div / price * 100, 4)
+        return round(float(dv[dv.index >= cutoff].sum()) / price * 100, 4)
     except Exception:
         return None
 
@@ -111,16 +114,22 @@ def quote():
     try:
         t = yf.Ticker(symbol)
 
-        # --- 메타데이터 (chart 엔드포인트, Render OK) → 이름/타입 ---
+        # 1) history 먼저 (chart 엔드포인트=안정) → history_metadata 채워짐 + beta에 재사용
+        hist = None
+        try:
+            hist = t.history(period="1y", auto_adjust=True)
+        except Exception:
+            hist = None
+
         meta = {}
         try:
             meta = t.history_metadata or {}
         except Exception:
             meta = {}
         name = meta.get("longName") or meta.get("shortName") or symbol
-        qtype = (meta.get("instrumentType") or "").upper()  # EQUITY / ETF / ...
+        qtype = (meta.get("instrumentType") or "").upper()
 
-        # --- fast_info (chart, Render OK) → 가격/시총/52주/MA ---
+        # 2) fast_info → 가격/시총/52주/MA (+history 폴백)
         fi = t.fast_info
         price = safe_attr(fi, "last_price") or num(meta.get("regularMarketPrice"))
         market_cap = safe_attr(fi, "market_cap")
@@ -129,44 +138,51 @@ def quote():
         week52_low = safe_attr(fi, "year_low") or num(meta.get("fiftyTwoWeekLow"))
         ma50 = safe_attr(fi, "fifty_day_average")
         ma200 = safe_attr(fi, "two_hundred_day_average")
+        if hist is not None and not hist.empty:
+            c = hist["Close"]
+            if week52_high is None: week52_high = float(c.max())
+            if week52_low is None: week52_low = float(c.min())
+            if ma50 is None and len(c) >= 50: ma50 = float(c.tail(50).mean())
+            if ma200 is None and len(c) >= 200: ma200 = float(c.tail(200).mean())
+            if price is None: price = float(c.iloc[-1])
 
-        # 공통 결과 틀
         out = {
             "ok": True, "ticker": symbol, "type": qtype or "UNKNOWN", "name": name,
             "price": price, "currency": currency, "marketCap": market_cap,
-            "week52High": week52_high, "week52Low": week52_low,
-            "ma50": ma50, "ma200": ma200,
+            "week52High": week52_high, "week52Low": week52_low, "ma50": ma50, "ma200": ma200,
             "dividendYield": dividend_yield_ttm(t, price),
-            # 개별주
             "trailingPE": None, "trailingEps": None, "roe": None, "debtToEquity": None,
             "operatingMargin": None, "revenueGrowth": None, "beta": None,
-            # ETF
             "expenseRatio": None, "aum": None, "category": None, "isLeveraged": None,
             "source": "yfinance(statements)",
         }
         diag = {}
 
         if qtype == "ETF":
-            # ETF: 운용보수/카테고리 — funds_data 시도(quoteSummary라 Render에서 막힐 수 있음)
             cat = None
+            er = None
             try:
                 fd = t.funds_data
                 ov = getattr(fd, "fund_overview", None) or {}
                 cat = ov.get("categoryName")
                 fo = getattr(fd, "fund_operations", None)
                 if fo is not None and not fo.empty and "Annual Report Expense Ratio" in fo.index:
-                    er = num(fo.loc["Annual Report Expense Ratio"].iloc[0])  # 소수(0.0075)
-                    out["expenseRatio"] = round(er * 100, 4) if er is not None else None  # → 퍼센트(0.75)
+                    v = num(fo.loc["Annual Report Expense Ratio"].iloc[0])
+                    er = round(v * 100, 4) if v is not None else None
                 diag["fundsData"] = "ok"
             except Exception as e:
                 diag["fundsData"] = f"ERR {type(e).__name__}"
-            out["category"] = cat
+
+            ov_map = ETF_OVERRIDES.get(symbol, {})
+            out["expenseRatio"] = er if er is not None else ov_map.get("expenseRatio")
+            out["category"] = cat or ov_map.get("category")
             lname = (name or "").lower()
-            out["isLeveraged"] = ("leverage" in (cat or "").lower()) or bool(re.search(r"\b[23]x\b", lname)) or ("bull" in lname or "bear" in lname)
-            # AUM: funds_data Total Net Assets는 단위 불일치로 보류. (Render에서 .info 차단)
+            inferred = ("leverage" in (out["category"] or "").lower()) or bool(re.search(r"\b[23]x\b", lname)) or ("bull" in lname or "bear" in lname)
+            out["isLeveraged"] = ov_map.get("isLeveraged", inferred)
+            if symbol in ETF_OVERRIDES and diag.get("fundsData", "").startswith("ERR"):
+                diag["etfSource"] = "override"
 
         else:
-            # 개별주(EQUITY 등): 재무제표에서 직접 계산
             inc = t.income_stmt
             qi = t.quarterly_income_stmt
             qbs = t.quarterly_balance_sheet
@@ -175,35 +191,34 @@ def quote():
                     "qiOk": not getattr(qi, "empty", True),
                     "qbsOk": not getattr(qbs, "empty", True)}
 
-            # 영업이익률 (연간, 안정적)
             rev_a = L(inc, "Total Revenue", "Operating Revenue")
             opinc_a = L(inc, "Operating Income", "Total Operating Income As Reported")
             out["operatingMargin"] = round(opinc_a / rev_a, 5) if (opinc_a and rev_a) else None
 
-            # 매출성장률 (최근 분기 YoY = .info 방식)
             qrev0 = L(qi, "Total Revenue", "Operating Revenue", col=0)
             qrev4 = L(qi, "Total Revenue", "Operating Revenue", col=4)
             out["revenueGrowth"] = round((qrev0 - qrev4) / qrev4, 5) if (qrev0 and qrev4) else None
 
-            # EPS(TTM) & PER
             eps_ttm = ttm(qi, "Diluted EPS", "Basic EPS") or L(inc, "Diluted EPS", "Basic EPS")
             out["trailingEps"] = round(eps_ttm, 2) if eps_ttm else None
             out["trailingPE"] = round(price / eps_ttm, 2) if (price and eps_ttm and eps_ttm > 0) else None
 
-            # ROE (TTM 순이익 / 최신 분기 자기자본)
             ni_ttm = ttm(qi, "Net Income", "Net Income Common Stockholders")
             equity = L(qbs, "Stockholders Equity", "Common Stock Equity") or L(bs, "Stockholders Equity", "Common Stock Equity")
             out["roe"] = round(ni_ttm / equity, 4) if (ni_ttm and equity) else None
 
-            # 부채비율 (분기 MRQ = .info와 일치)
             debt = L(qbs, "Total Debt") or L(bs, "Total Debt")
             out["debtToEquity"] = round(debt / equity * 100, 2) if (debt and equity) else None
 
-            # 베타 (1년 일간 vs SPY, 근사)
-            out["beta"] = round(compute_beta(symbol), 3) if compute_beta(symbol) else None
+            if hist is not None and not hist.empty:
+                try:
+                    spy = yf.Ticker("SPY").history(period="1y", auto_adjust=True)["Close"]
+                    b = beta_from(hist["Close"], spy)
+                    out["beta"] = round(b, 3) if b else None
+                except Exception:
+                    out["beta"] = None
 
-        # 데이터가 거의 다 비면 차단으로 판단
-        if price is None and market_cap is None and out["operatingMargin"] is None:
+        if price is None and market_cap is None and out["operatingMargin"] is None and out["expenseRatio"] is None:
             return jsonify({"ok": False, "ticker": symbol,
                             "error": "yfinance 데이터 없음(차단 의심). Render 로그 확인.",
                             "_diag": diag}), 502
