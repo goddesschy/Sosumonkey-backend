@@ -136,5 +136,39 @@ def quote():
         return jsonify({"ok": False, "ticker": symbol, "error": f"{type(e).__name__}: {e}"}), 502
 
 
+@app.route("/diag")
+def diag():
+    """Render IP에서 어떤 yfinance 데이터 경로가 살아있는지 한 방에 판별.
+    각 경로가 데이터를 주는지(df 크기/dict 키수)/에러인지 보고."""
+    symbol = (request.args.get("ticker") or "AAPL").strip().upper()
+    t = yf.Ticker(symbol)
+    out = {}
+
+    def probe(label, fn):
+        try:
+            v = fn()
+            if v is None:
+                out[label] = "none"
+            elif hasattr(v, "empty"):
+                out[label] = "EMPTY" if v.empty else f"shape {tuple(v.shape)}"
+            elif isinstance(v, dict):
+                out[label] = f"dict {len(v)}"
+            else:
+                out[label] = f"{type(v).__name__}={v}"
+        except Exception as e:
+            out[label] = f"ERR {type(e).__name__}"
+
+    probe("fast_info.last_price", lambda: t.fast_info.last_price)
+    probe("info", lambda: t.info)
+    probe("get_info", lambda: t.get_info())
+    probe("income_stmt(annual)", lambda: t.income_stmt)
+    probe("quarterly_income_stmt", lambda: t.quarterly_income_stmt)
+    probe("balance_sheet", lambda: t.balance_sheet)
+    probe("history_1y", lambda: t.history(period="1y"))
+    probe("dividends", lambda: t.dividends)
+    return jsonify({"ticker": symbol, "probe": out})
+
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
